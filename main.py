@@ -1,11 +1,12 @@
+import sys
 import argparse
 from datetime import datetime
 import random
 import numpy as np
 import torch
 from Rewriter import CommRewriting
-from Locator import CommMatching
-from utils import split_communities, eval_scores, prepare_data
+from Locator import CommMatching, gnn_embedding
+from utils import split_communities, eval_scores, prepare_data, count_folders_starting_with_time
 import os
 from utils.helper_funcs import assign_free_gpus
 
@@ -31,9 +32,13 @@ def read4file(filename):
     return pred
 
 
-if __name__ == "__main__":
+def parse_args(args):
     parser = argparse.ArgumentParser()
-
+    # # CTGCN
+    # parser = argparse.ArgumentParser(prog='CTGCN', description='K-core based Temporal Graph Convolutional Network')
+    # parser.add_argument('--config', nargs=1, type=str, help='configuration file path', required=True)
+    # parser.add_argument('--task', type=str, default='embedding', help='task name which is needed to run', required=True)
+    # parser.add_argument('--method', type=str, default=None, help='graph embedding method, only used for embedding task')
     # General Config
     parser.add_argument("--seed", type=int, help="seed", default=0)
     parser.add_argument("--device", dest="device", type=str, help="training device", default="cuda:0")
@@ -42,7 +47,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_pred", type=int, help="pred size", default=1000)
     parser.add_argument("--num_train", type=int, help="pred size", default=90)
     parser.add_argument("--num_val", type=int, help="pred size", default=10)
-    parser.add_argument("--already_train_test", type=bool, help="If the train and test communities are already defined", default=True)
+    parser.add_argument("--already_train_test", type=bool, help="If the train and test communities are already defined",
+                        default=True)
     parser.add_argument("--multiplier", type=float, help="multiplier", default=1.0)
 
     # Community Locator related
@@ -72,17 +78,68 @@ if __name__ == "__main__":
 
     # Save log
     parser.add_argument("--writer_dir", type=str, help="Summary writer directory", default="")
+    return parser.parse_args(args)
 
-    args = parser.parse_args()
+
+def parse_json_args(file_path):
+    config_file = open(file_path)
+    json_config = json.load(config_file)
+    config_file.close()
+    return json_config
+
+
+def preprocessing_task(method, args):
+    from preprocessing import preprocess
+    assert method in ['GCN', 'GCN_TG', 'GAT', 'GAT_TG', 'SAGE', 'SAGE_TG', 'GIN', 'GIN_TG', 'PGNN', 'CGCN-C', 'GCRN', 'EvolveGCN', 'CTGCN-C']
+    preprocess(method, args[method])
+
+
+def embedding_task(method, args):
+    print(args)
+
+    # from baseline.dynAE import dyngem_embedding
+    # from baseline.timers import timers_embedding
+    # from train import gnn_embedding
+    args['has_cuda'] = True if torch.cuda.is_available() else False
+
+    if not args['has_cuda'] and 'use_cuda' in args and args['use_cuda']:
+        # raise Exception('No CUDA devices is available, but you still try to use CUDA!')
+        args['use_cuda'] = False
+    if 'use_cuda' in args:
+        args['has_cuda'] &= args['use_cuda']
+    if not args['has_cuda']:  # Use CPU
+        torch.set_num_threads(args['thread_num'])
+
+    gnn_embedding(method, args)
+
+
+if __name__ == "__main__":
+    args = parse_args(sys.argv[1:])
+    # print('args:', args)
+    # config_dict = parse_json_args(args.config[0])
     seed_all(args.seed)
-
-    # If run on GPU, we need to assign free GPUs
-    if args.device == "cuda:0":
-        assign_free_gpus(max_gpus=1)
+    #
+    # # If run on GPU, we need to assign free GPUs
+    # if args.device == "cuda:0":
+    #     assign_free_gpus(max_gpus=1)
+    #
+    # if args.task == 'preprocessing':
+    #     args_dict = config_dict[args.task]
+    #     if args.method is None:
+    #         raise AttributeError('Embedding method parameter is needed for the preprocessing task!')
+    #     preprocessing_task(args.method, args_dict)
+    # elif args.task == 'embedding':
+    #     args_dict = config_dict[args.task]
+    #     if args.method is None:
+    #         raise AttributeError('Embedding method parameter is needed for the graph embedding task!')
+    #     param_dict = args_dict[args.method]
+    #     if not args['already_embedding']:
+    #         embedding_task(args.method, param_dict)
+    # else:
+    #     raise AttributeError('Unsupported task!')
 
     print('= ' * 20)
     print('##  Starting Time:', datetime.now().strftime("%Y-%m-%d %H:%M:%S"), flush=True)
-    print(args)
 
     if not os.path.exists(f"ckpts/{args.dataset}"):
         os.mkdir(f"ckpts/{args.dataset}")
@@ -91,28 +148,25 @@ if __name__ == "__main__":
     j_list = []
     nmi_list = []
 
-    time_len = len(os.listdir(f"./dataset/{args.dataset}/"))
-    for time in range(time_len):
-        print(f'## Start Timestep {time} ...')
-        # args.writer_dir = f"ckpts/{args.dataset}/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        args.writer_dir = f"ckpts/{args.dataset}/{time}"
-        os.mkdir(args.writer_dir)
-        args.comm_max_size = 20 if args.dataset.startswith("lj") else 12
+    # args.writer_dir = f"ckpts/{args.dataset}/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    args.comm_max_size = 20 if args.dataset.startswith("lj") else 12
 
-        ##########################################################
-        ################### Step 1 Load Data #####################
-        ##########################################################
+    time_len = count_folders_starting_with_time(f"./dataset/{args.dataset}/") 
+    for time in range(time_len):
+
+        args.writer_dir = f"ckpts/{args.dataset}/{time}"
+        if not os.path.exists(args.writer_dir):
+            os.mkdir(args.writer_dir)
+
         num_node, num_edge, num_community, graph_data, nx_graph, communities, mapping = prepare_data(args.dataset, time)
-        print(f"Finish loading data: {graph_data}\n")
-        train_comms, val_comms, test_comms = split_communities(communities, args.num_train, args.num_val, args.already_train_test, args.dataset, time, mapping)
-        # DEVO SCRIVERE QUELLA NUOVA PENSANDO A COME ESTRARRE VAL_COMMS
-        print(f"Split dataset: #Train {len(train_comms)}, #Val {len(val_comms)}, #Test {len(test_comms)}\n")
+        train_comms, val_comms, test_comms = split_communities(communities, args.num_train, args.num_val,
+                                                               args.already_train_test, args.dataset, time, mapping)
 
         ##########################################################
         ################### Step 2 Train Locator##################
         ##########################################################
-        CommM_obj = CommMatching(args, graph_data, train_comms, val_comms, device=torch.device(args.device))
-        CommM_obj.train()
+        CommM_obj = CommMatching(args, graph_data, train_comms, val_comms, time, device=torch.device(args.device), mapping=mapping)
+        # CommM_obj.train()
         pred_comms = CommM_obj.predict_community(nx_graph, args.comm_max_size)
         f1, jaccard, onmi = eval_scores(pred_comms, test_comms, train_comms, val_comms, tmp_print=True)
         metrics_string = '_'.join([f'{x:0.4f}' for x in [f1, jaccard, onmi]])
